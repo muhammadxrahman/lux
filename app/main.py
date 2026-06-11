@@ -17,7 +17,7 @@ from app.schemas import (
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    engine.load()
+    engine.start()
     yield
 
 
@@ -30,13 +30,13 @@ def health():
 
 
 @app.post("/v1/chat/completions")
-def chat_completions(req: ChatCompletionRequest):
+async def chat_completions(req: ChatCompletionRequest):
     if req.stream:
         return StreamingResponse(
             _stream_sse(req), media_type="text/event-stream"
         )
 
-    text = engine.complete(req.messages, req.max_tokens)
+    text = await engine.submit_batch(req.messages, req.max_tokens)
     return ChatCompletionResponse(
         model=req.model,
         choices=[
@@ -56,7 +56,7 @@ def _stream_sse(req: ChatCompletionRequest):
         "created": created,
         "model": req.model,
     }
-    for piece in engine.stream(req.messages, req.max_tokens):
+    for piece in engine.submit_stream(req.messages, req.max_tokens):
         chunk = {
             **base,
             "choices": [

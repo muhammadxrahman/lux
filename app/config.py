@@ -10,6 +10,8 @@ class Settings(BaseSettings):
     host: str = "127.0.0.1"
     port: int = 8000
     max_tokens: int = 512
+    
+    max_batch_size: int = 8
 
 
 settings = Settings()
