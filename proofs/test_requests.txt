@@ -1,0 +1,11 @@
+
+-- Non-streaming
+curl -X POST localhost:8000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{"model":"llama-3.2-3b","messages":[{"role":"user","content":"Say hello in one sentence."}],"max_tokens":40}'
+
+
+-- Streaming
+  curl -N -X POST localhost:8000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{"model":"llama-3.2-3b","messages":[{"role":"user","content":"Count to five."}],"max_tokens":40,"stream":true}'
