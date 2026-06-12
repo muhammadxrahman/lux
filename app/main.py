@@ -56,7 +56,13 @@ def _stream_sse(req: ChatCompletionRequest):
         "created": created,
         "model": req.model,
     }
-    for piece in engine.submit_stream(req.messages, req.max_tokens):
+    for piece in engine.submit_stream(
+        req.messages,
+        req.max_tokens,
+        temperature=req.temperature,
+        top_k=req.top_k,
+        top_p=req.top_p,
+    ):
         chunk = {
             **base,
             "choices": [

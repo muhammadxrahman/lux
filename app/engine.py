@@ -1,3 +1,4 @@
+from app.sampling import make_sampler
 import copy
 import mlx.core as mx
 from mlx_lm.models.cache import make_prompt_cache
@@ -24,6 +25,9 @@ class _Job:
     loop: Optional[asyncio.AbstractEventLoop] = None
     future: Optional[asyncio.Future] = None
     out_queue: Optional[queue.Queue] = None
+    temperature: float = 1.0
+    top_k: int = 0
+    top_p: float = 1.0
 
 
 class Engine:
@@ -82,7 +86,12 @@ class Engine:
         return await fut
 
     def submit_stream(
-        self, messages: list[ChatMessage], max_tokens: int
+        self,
+        messages: list[ChatMessage],
+        max_tokens: int,
+        temperature: float = 1.0,
+        top_k: int = 0,
+        top_p: float = 1.0,
     ) -> Iterator[str]:
         out: queue.Queue = queue.Queue()
         self._jobs.put(
@@ -91,6 +100,9 @@ class Engine:
                 max_tokens=max_tokens,
                 prompt_str=self._encode_str(messages),
                 out_queue=out,
+                temperature=temperature,
+                top_k=top_k,
+                top_p=top_p,
             )
         )
         while True:
@@ -161,12 +173,14 @@ class Engine:
                 j.loop.call_soon_threadsafe(j.future.set_exception, exc)
 
     def _do_stream(self, job: _Job):
+        sampler = make_sampler(job.temperature, job.top_k, job.top_p)
         try:
             for chunk in stream_generate(
                 self.model,
                 self.tokenizer,
                 prompt=job.prompt_str,
                 max_tokens=job.max_tokens,
+                sampler=sampler,
             ):
                 job.out_queue.put(chunk.text)
         finally:
