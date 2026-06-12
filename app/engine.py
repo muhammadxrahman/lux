@@ -1,3 +1,6 @@
+import copy
+import mlx.core as mx
+from mlx_lm.models.cache import make_prompt_cache
 import asyncio
 import queue
 import threading
@@ -32,6 +35,8 @@ class Engine:
         self._thread = threading.Thread(
             target=self._run, name="gpu-scheduler", daemon=True
         )
+        self._prefix_ids: list[int] = []
+        self._prefix_cache = None
 
     # --- lifecycle ---
     def start(self):
@@ -41,6 +46,8 @@ class Engine:
     def _run(self):
         # Load on THIS thread so the model and all GPU work share one thread.
         self.model, self.tokenizer = load(settings.model_path)
+        if settings.enable_prefix_cache:
+            self._build_prefix_cache()
         self._ready.set()
         self._loop()  # never returns
 
@@ -117,16 +124,39 @@ class Engine:
                 self._do_batch(batch)
 
     def _do_batch(self, jobs: list[_Job]):
-        print(f"[scheduler] running batch of {len(jobs)}")
-        prompts = [j.prompt_ids for j in jobs]
-        max_toks = [j.max_tokens for j in jobs]
+        prompts, caches, used = [], [], 0
+        for j in jobs:
+            suffix, hit = self._strip_prefix(j.prompt_ids)
+            prompts.append(suffix)
+            if hit:
+                caches.append(copy.deepcopy(self._prefix_cache))
+                used += 1
+            else:
+                caches.append(None)
+
+        # batch_generate wants either no caches, or a cache per prompt.
+        # If none hit, pass None; if any hit, we must supply a full list.
+        if used == 0:
+            batch_caches = None
+        else:
+            # fill the misses with fresh empty caches so lengths line up
+            batch_caches = [
+                c if c is not None else make_prompt_cache(self.model)
+                for c in caches
+            ]
+
+        print(f"[scheduler] batch of {len(jobs)} | prefix hits: {used}")
         try:
             resp = batch_generate(
-                self.model, self.tokenizer, prompts=prompts, max_tokens=max_toks
+                self.model,
+                self.tokenizer,
+                prompts=prompts,
+                prompt_caches=batch_caches,
+                max_tokens=[j.max_tokens for j in jobs],
             )
             for j, text in zip(jobs, resp.texts):
                 j.loop.call_soon_threadsafe(j.future.set_result, text)
-        except Exception as exc:  # deliver the error to every waiter in the batch
+        except Exception as exc:
             for j in jobs:
                 j.loop.call_soon_threadsafe(j.future.set_exception, exc)
 
@@ -141,6 +171,44 @@ class Engine:
                 job.out_queue.put(chunk.text)
         finally:
             job.out_queue.put(_SENTINEL)
+            
+            
+    def _build_prefix_cache(self):
+        # Tokenize the system block alone, opening the user turn, so the
+        # cached prefix ends exactly where real requests' user content begins.
+        msgs = [{"role": "system", "content": settings.system_prompt}]
+        # add_generation_prompt=False here: we want the user-turn header,
+        # not the assistant header. We append the user header explicitly by
+        # tokenizing a sentinel request and taking the shared lead.
+        probe_a = self._encode_ids(
+            [ChatMessage(role="system", content=settings.system_prompt),
+             ChatMessage(role="user", content="x")]
+        )
+        probe_b = self._encode_ids(
+            [ChatMessage(role="system", content=settings.system_prompt),
+             ChatMessage(role="user", content="y")]
+        )
+        L = 0
+        for x, y in zip(probe_a, probe_b):
+            if x != y:
+                break
+            L += 1
+        self._prefix_ids = probe_a[:L]
+        cache = make_prompt_cache(self.model)
+        mx.eval(self.model(mx.array([self._prefix_ids]), cache=cache))
+        self._prefix_cache = cache
+        print(f"[prefix] cached {L} shared tokens")
+
+    def _strip_prefix(self, ids: list[int]):
+        # Returns (suffix, used_cache_bool). Only strips on an exact match.
+        p = self._prefix_ids
+        if (
+            self._prefix_cache is not None
+            and len(ids) > len(p)
+            and ids[: len(p)] == p
+        ):
+            return ids[len(p):], True
+        return ids, False
 
 
 engine = Engine()

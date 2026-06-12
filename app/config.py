@@ -12,6 +12,11 @@ class Settings(BaseSettings):
     max_tokens: int = 512
     
     max_batch_size: int = 8
+    system_prompt: str = (
+        "You are a helpful assistant. Answer concisely and accurately. "
+        "Always be polite and clear, and never make up information."
+    )
+    enable_prefix_cache: bool = True
 
 
 settings = Settings()
