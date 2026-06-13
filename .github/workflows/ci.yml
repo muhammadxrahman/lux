@@ -1,0 +1,38 @@
+name: CI
+
+# When to run: on every push and every pull request.
+on:
+  push:
+  pull_request:
+
+jobs:
+  sampler-tests:
+    runs-on: ubuntu-latest       
+
+    steps:
+      # 1. Get code onto the machine.
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      # 2. Install a known Python version.
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+
+      # 3. Install the minimal build/test dependencies.
+      - name: Install dependencies
+        run: pip install -r requirements-ci.txt
+
+      # 4. Build the C++ sampler the cross-platform way.
+      #    pybind11 picks the correct linker flags for Linux.
+      - name: Build C++ sampler
+        run: |
+          c++ -O3 -Wall -shared -std=c++17 -fPIC \
+            $(python -m pybind11 --includes) \
+            src/sampler.cpp src/bindings.cpp \
+            -o csampler$(python3-config --extension-suffix)
+
+      # 5. Run the correctness suite. Non-zero exit fails the job.
+      - name: Run sampler correctness tests
+        run: python proofs/check_sampler.py

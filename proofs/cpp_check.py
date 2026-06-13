@@ -1,5 +1,5 @@
 import numpy as np
-import csampler                       # your freshly compiled C++ module
+import csampler         
 from sampler_reference import sample_logits as py_sample
 
 # A small, fixed set of scores so we can eyeball it.

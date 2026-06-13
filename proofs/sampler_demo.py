@@ -17,7 +17,7 @@ print("number of scores (vocab size):", logits.shape[0])
 best = int(np.argmax(logits))
 print("greedy pick (highest score):", best, "->", repr(tokenizer.decode([best])))
 
-# Run our math half, then our dice half.
+# Run math half, then dice half.
 probs = sample_logits(logits, temperature=0.7, top_k=40, top_p=0.95)
 u = np.random.random()
 chosen = pick(probs, u)

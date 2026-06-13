@@ -31,4 +31,9 @@ for temp, top_k, top_p in cases:
         for w in worst:
             print(f"  idx {w}: cpp={cpp[w]:.6e} py={py[w]:.6e}")
 
-print("ALL MATCH" if all_ok else "SOME MISMATCHES, see above")
+import sys
+if all_ok:
+    print("ALL MATCH")
+else:
+    print("SOME MISMATCHES, see above")
+    sys.exit(1)  # non-zero exit -> CI marks the job failed

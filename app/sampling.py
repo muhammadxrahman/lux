@@ -1,7 +1,7 @@
 import numpy as np
 import mlx.core as mx
 
-import csampler  # your compiled C++ module
+import csampler  # compiled C++ module
 
 
 def make_sampler(temperature: float, top_k: int, top_p: float, seed: int | None = None):
