@@ -2,7 +2,7 @@ import json
 import time
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Response
 from fastapi.responses import StreamingResponse
 
 from app.config import settings
@@ -14,12 +14,16 @@ from app.schemas import (
     Choice,
 )
 
+import logging
+from prometheus_client import generate_latest, CONTENT_TYPE_LATEST
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     engine.start()
     yield
 
+logging.basicConfig(level=logging.INFO)
 
 app = FastAPI(lifespan=lifespan)
 
@@ -27,6 +31,11 @@ app = FastAPI(lifespan=lifespan)
 @app.get("/health")
 def health():
     return {"status": "ok", "model": settings.model_path}
+
+
+@app.get("/metrics")
+def metrics_endpoint():
+    return Response(generate_latest(), media_type=CONTENT_TYPE_LATEST)
 
 
 @app.post("/v1/chat/completions")

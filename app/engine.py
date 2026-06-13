@@ -6,12 +6,18 @@ import asyncio
 import queue
 import threading
 from dataclasses import dataclass
-from typing import Any, Iterator, Optional
+from typing import Iterator, Optional
 
 from mlx_lm import load, stream_generate, batch_generate
 
 from app.config import settings
 from app.schemas import ChatMessage
+import time
+import logging
+from app import metrics
+
+log = logging.getLogger("engine")
+
 
 _SENTINEL = object()  # marks end-of-stream in the per-request queue
 
@@ -115,6 +121,7 @@ class Engine:
     def _loop(self):
         while True:
             job = self._jobs.get()  # blocks until at least one job
+            metrics.QUEUE_DEPTH.set(self._jobs.qsize())
             if job.kind == "stream":
                 self._do_stream(job)
                 continue
@@ -143,21 +150,25 @@ class Engine:
             if hit:
                 caches.append(copy.deepcopy(self._prefix_cache))
                 used += 1
+                metrics.PREFIX_CACHE.labels(result="hit").inc()
             else:
                 caches.append(None)
+                metrics.PREFIX_CACHE.labels(result="miss").inc()
 
-        # batch_generate wants either no caches, or a cache per prompt.
-        # If none hit, pass None; if any hit, we must supply a full list.
         if used == 0:
             batch_caches = None
         else:
-            # fill the misses with fresh empty caches so lengths line up
             batch_caches = [
                 c if c is not None else make_prompt_cache(self.model)
                 for c in caches
             ]
 
-        print(f"[scheduler] batch of {len(jobs)} | prefix hits: {used}")
+        metrics.BATCH_SIZE.observe(len(jobs))
+        metrics.REQUESTS.labels(mode="batch").inc(len(jobs))
+        metrics.INFLIGHT.inc(len(jobs))
+        log.info("batch of %d | prefix hits: %d", len(jobs), used)
+
+        start = time.time()
         try:
             resp = batch_generate(
                 self.model,
@@ -166,14 +177,21 @@ class Engine:
                 prompt_caches=batch_caches,
                 max_tokens=[j.max_tokens for j in jobs],
             )
+            metrics.TOKENS.inc(resp.stats.generation_tokens)
             for j, text in zip(jobs, resp.texts):
                 j.loop.call_soon_threadsafe(j.future.set_result, text)
         except Exception as exc:
             for j in jobs:
                 j.loop.call_soon_threadsafe(j.future.set_exception, exc)
+        finally:
+            metrics.GENERATION_SECONDS.observe(time.time() - start)
+            metrics.INFLIGHT.dec(len(jobs))
 
     def _do_stream(self, job: _Job):
         sampler = make_sampler(job.temperature, job.top_k, job.top_p)
+        metrics.REQUESTS.labels(mode="stream").inc()
+        metrics.INFLIGHT.inc()
+        start = time.time()
         try:
             for chunk in stream_generate(
                 self.model,
@@ -182,8 +200,11 @@ class Engine:
                 max_tokens=job.max_tokens,
                 sampler=sampler,
             ):
+                metrics.TOKENS.inc()
                 job.out_queue.put(chunk.text)
         finally:
+            metrics.GENERATION_SECONDS.observe(time.time() - start)
+            metrics.INFLIGHT.dec()
             job.out_queue.put(_SENTINEL)
             
             
