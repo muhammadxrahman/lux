@@ -110,6 +110,12 @@ scheduler drains a queue of pending requests, groups non-streaming
 ones into a batch, and runs them together. Streaming requests run
 one at a time through the sampler.
 
+The same verified C++ sampler drives **both** paths. Batched
+requests use one sampler instance per request (via
+`BatchGenerator`'s per-sequence samplers), so each request's
+`temperature`, `top_k` and `top_p` are honored even when requests
+share a batch.
+
 The C++ sampler is verified against a Python reference
 implementation across the full parameter space. The test runs in
 CI on every push.
@@ -121,7 +127,33 @@ python3 proofs/check_sampler.py
 ```
 
 This builds nothing on its own; run `./build.sh` first. The same
-test runs automatically in GitHub Actions.
+test runs automatically in GitHub Actions. It verifies both C++
+entry points (the list-based `sample_logits` and the zero-copy
+`sample_logits_np` used in the hot path) against the reference.
+
+## Benchmarks
+
+```bash
+python3 bench/bench_sampler.py     # sampler cost per token (no model needed)
+python3 bench/bench_server.py      # end-to-end throughput (needs a running server)
+```
+
+The sampler runs once per generated token on the GPU scheduler
+thread, so its per-call cost is a direct tax on throughput. At
+Llama 3.2's 128,256-token vocabulary (`bench/bench_sampler.py`,
+Apple Silicon):
+
+| approach                      | µs/token | vs NumPy |
+|-------------------------------|---------:|---------:|
+| NumPy reference               |   1857   |  1.00x   |
+| C++ via Python list (old)     |   5771   |  0.32x   |
+| C++ zero-copy (current)       |   1030   |  1.80x   |
+
+The original C++ path was **3x slower than NumPy**: converting a
+128k-element logit vector to a Python list per token cost more than
+the math it saved. Reading the NumPy buffer directly in C++
+(`sample_logits_np`) removed that overhead, making the C++ kernel a
+genuine 1.8x win and 5.6x faster than the old path.
 
 ## Deployment and portability
 

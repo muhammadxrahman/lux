@@ -8,7 +8,8 @@ import threading
 from dataclasses import dataclass
 from typing import Iterator, Optional
 
-from mlx_lm import load, stream_generate, batch_generate
+from mlx_lm import load, stream_generate
+from mlx_lm.generate import BatchGenerator
 
 from app.config import settings
 from app.schemas import ChatMessage
@@ -76,7 +77,12 @@ class Engine:
 
     # --- public submit APIs ---
     async def submit_batch(
-        self, messages: list[ChatMessage], max_tokens: int
+        self,
+        messages: list[ChatMessage],
+        max_tokens: int,
+        temperature: float = 1.0,
+        top_k: int = 0,
+        top_p: float = 1.0,
     ) -> str:
         loop = asyncio.get_running_loop()
         fut = loop.create_future()
@@ -87,6 +93,9 @@ class Engine:
                 prompt_ids=self._encode_ids(messages),
                 loop=loop,
                 future=fut,
+                temperature=temperature,
+                top_k=top_k,
+                top_p=top_p,
             )
         )
         return await fut
@@ -163,27 +172,51 @@ class Engine:
                 for c in caches
             ]
 
+        # One verified sampler per request, so each request's temperature,
+        # top_k and top_p are honored even when requests share a batch. This
+        # is the same make_sampler the streaming path uses; BatchGenerator
+        # keeps the per-sequence samplers aligned as sequences finish.
+        samplers = [make_sampler(j.temperature, j.top_k, j.top_p) for j in jobs]
+
         metrics.BATCH_SIZE.observe(len(jobs))
         metrics.REQUESTS.labels(mode="batch").inc(len(jobs))
         metrics.INFLIGHT.inc(len(jobs))
         log.info("batch of %d | prefix hits: %d", len(jobs), used)
 
         start = time.time()
+        gen = None
         try:
-            resp = batch_generate(
+            # We drive BatchGenerator directly (instead of the batch_generate
+            # convenience wrapper) because only insert() accepts per-prompt
+            # samplers; the wrapper would force a single shared sampler.
+            gen = BatchGenerator(
                 self.model,
-                self.tokenizer,
-                prompts=prompts,
-                prompt_caches=batch_caches,
-                max_tokens=[j.max_tokens for j in jobs],
+                stop_tokens=[[t] for t in self.tokenizer.eos_token_ids],
             )
-            metrics.TOKENS.inc(resp.stats.generation_tokens)
-            for j, text in zip(jobs, resp.texts):
+            uids = gen.insert(
+                prompts,
+                max_tokens=[j.max_tokens for j in jobs],
+                caches=batch_caches,
+                samplers=samplers,
+            )
+            results: dict = {uid: [] for uid in uids}
+            with gen.stats() as stats:
+                while responses := gen.next_generated():
+                    for r in responses:
+                        # The eos "stop" token is signalled but not emitted.
+                        if r.finish_reason != "stop":
+                            results[r.uid].append(r.token)
+
+            metrics.TOKENS.inc(stats.generation_tokens)
+            for j, uid in zip(jobs, uids):
+                text = self.tokenizer.decode(results[uid])
                 j.loop.call_soon_threadsafe(j.future.set_result, text)
         except Exception as exc:
             for j in jobs:
                 j.loop.call_soon_threadsafe(j.future.set_exception, exc)
         finally:
+            if gen is not None:
+                gen.close()
             metrics.GENERATION_SECONDS.observe(time.time() - start)
             metrics.INFLIGHT.dec(len(jobs))
 

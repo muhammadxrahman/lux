@@ -20,16 +20,26 @@ for temp in [0.0, 0.5, 1.0, 1.3]:
 all_ok = True
 for temp, top_k, top_p in cases:
     logits = random_logits()
-    cpp = np.array(csampler.sample_logits(logits, temp, top_k, top_p))
     py = py_sample(logits, temperature=temp, top_k=top_k, top_p=top_p)
-    if not np.allclose(cpp, py, atol=1e-9):
-        all_ok = False
-        print(f"MISMATCH temp={temp} top_k={top_k} top_p={top_p}")
-        # show the few biggest differences for debugging
-        diff = np.abs(cpp - py)
-        worst = np.argsort(diff)[::-1][:5]
-        for w in worst:
-            print(f"  idx {w}: cpp={cpp[w]:.6e} py={py[w]:.6e}")
+
+    # Verify BOTH C++ entry points against the reference: the list-based one
+    # and the zero-copy NumPy one that actually runs in the server hot path.
+    cpp = np.array(csampler.sample_logits(logits, temp, top_k, top_p))
+    cpp_np = np.array(
+        csampler.sample_logits_np(
+            np.asarray(logits, dtype=np.float64), temp, top_k, top_p
+        )
+    )
+
+    for label, got in (("sample_logits", cpp), ("sample_logits_np", cpp_np)):
+        if not np.allclose(got, py, atol=1e-9):
+            all_ok = False
+            print(f"MISMATCH [{label}] temp={temp} top_k={top_k} top_p={top_p}")
+            # show the few biggest differences for debugging
+            diff = np.abs(got - py)
+            worst = np.argsort(diff)[::-1][:5]
+            for w in worst:
+                print(f"  idx {w}: cpp={got[w]:.6e} py={py[w]:.6e}")
 
 import sys
 if all_ok:

@@ -45,7 +45,13 @@ async def chat_completions(req: ChatCompletionRequest):
             _stream_sse(req), media_type="text/event-stream"
         )
 
-    text = await engine.submit_batch(req.messages, req.max_tokens)
+    text = await engine.submit_batch(
+        req.messages,
+        req.max_tokens,
+        temperature=req.temperature,
+        top_k=req.top_k,
+        top_p=req.top_p,
+    )
     return ChatCompletionResponse(
         model=req.model,
         choices=[
