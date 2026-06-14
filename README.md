@@ -25,7 +25,7 @@ inference on Mac.
 ## Requirements
 
 - macOS on Apple Silicon (M-series).
-- Python 3.12 or newer.
+- Python 3.14 or newer.
 - A C++ compiler (Xcode command line tools: `xcode-select --install`).
 
 ## Setup
