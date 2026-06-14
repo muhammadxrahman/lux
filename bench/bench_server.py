@@ -71,10 +71,46 @@ def measure_ttft(client, model, max_tokens):
         temperature=0.7,
         stream=True,
     )
+    ttft = float("nan")
+    # Drain the whole stream even after the first token: the server has no
+    # disconnect-cancellation yet, so abandoning a stream leaves it generating
+    # and would skew the next measurement.
     for event in stream:
-        if event.choices and event.choices[0].delta.content:
-            return time.perf_counter() - t0
-    return float("nan")
+        has_content = event.choices and event.choices[0].delta.content
+        if has_content and ttft != ttft:  # ttft still NaN -> first token
+            ttft = time.perf_counter() - t0
+    return ttft
+
+
+def measure_concurrent_stream_ttft(client, model, n, max_tokens):
+    """Fire n streaming requests at once and record each one's TTFT.
+
+    This is the headline continuous-batching result: before, streams were
+    served strictly one at a time, so the k-th stream's first token waited for
+    the previous k-1 to finish and TTFT grew with n. Now streams share decode
+    steps, so TTFT should stay roughly flat as n rises.
+    """
+    ttfts = []
+    lock = threading.Lock()
+
+    def worker():
+        dt = measure_ttft(client, model, max_tokens)
+        with lock:
+            ttfts.append(dt)
+
+    threads = [threading.Thread(target=worker) for _ in range(n)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    ttfts.sort()
+    return {
+        "n": n,
+        "min_ms": ttfts[0] * 1000,
+        "p50_ms": ttfts[len(ttfts) // 2] * 1000,
+        "max_ms": ttfts[-1] * 1000,
+    }
 
 
 def main():
@@ -88,7 +124,15 @@ def main():
     client = OpenAI(base_url=args.base_url, api_key="unused")
 
     ttft = measure_ttft(client, args.model, args.max_tokens)
-    print(f"streaming time-to-first-token: {ttft * 1000:.0f} ms\n")
+    print(f"single-stream time-to-first-token: {ttft * 1000:.0f} ms\n")
+
+    print("concurrent streaming TTFT (continuous batching keeps this flat):")
+    print(f"{'streams':>8}{'min (ms)':>11}{'p50 (ms)':>11}{'max (ms)':>11}")
+    print("-" * 41)
+    for c in args.levels:
+        r = measure_concurrent_stream_ttft(client, args.model, c, args.max_tokens)
+        print(f"{r['n']:>8}{r['min_ms']:>11.0f}{r['p50_ms']:>11.0f}{r['max_ms']:>11.0f}")
+    print()
 
     print(f"{'concurrency':>11}{'wall (s)':>10}{'tok/s':>10}{'p50 (s)':>10}")
     print("-" * 41)

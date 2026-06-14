@@ -25,15 +25,21 @@ INFLIGHT = Gauge(
     "inference_inflight_requests",
     "Requests currently generating",
 )
+ACTIVE_SEQUENCES = Gauge(
+    "inference_active_sequences",
+    "Sequences decoding together in the current step (continuous-batch width)",
+)
 
 # Histograms: distributions, so we can ask for percentiles later.
 BATCH_SIZE = Histogram(
     "inference_batch_size",
-    "How many requests were grouped into each batch",
-    buckets=[1, 2, 3, 4, 5, 6, 7, 8, 12, 16],
+    # With continuous batching there is no discrete batch; we observe the
+    # number of sequences that decoded together in each step.
+    "Sequences decoded together per step",
+    buckets=[1, 2, 3, 4, 5, 6, 7, 8, 12, 16, 24, 32],
 )
 GENERATION_SECONDS = Histogram(
     "inference_generation_seconds",
-    "Wall-clock time per generation call",
-    buckets=[0.05, 0.1, 0.25, 0.5, 1, 2, 5, 10, 30],
+    "Wall-clock time per decode step",
+    buckets=[0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2],
 )

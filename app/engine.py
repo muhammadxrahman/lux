@@ -5,10 +5,10 @@ from mlx_lm.models.cache import make_prompt_cache
 import asyncio
 import queue
 import threading
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Iterator, Optional
 
-from mlx_lm import load, stream_generate
+from mlx_lm import load
 from mlx_lm.generate import BatchGenerator
 
 from app.config import settings
@@ -27,14 +27,21 @@ _SENTINEL = object()  # marks end-of-stream in the per-request queue
 class _Job:
     kind: str  # "batch" or "stream"
     max_tokens: int
-    prompt_ids: Optional[list[int]] = None          # batch jobs carry token IDs
-    prompt_str: Optional[str] = None                # stream jobs carry a string
-    loop: Optional[asyncio.AbstractEventLoop] = None
-    future: Optional[asyncio.Future] = None
-    out_queue: Optional[queue.Queue] = None
+    prompt_ids: list[int]
+    loop: Optional[asyncio.AbstractEventLoop] = None  # batch jobs only
+    future: Optional[asyncio.Future] = None           # batch jobs only
+    out_queue: Optional[queue.Queue] = None           # stream jobs only
     temperature: float = 1.0
     top_k: int = 0
     top_p: float = 1.0
+
+
+@dataclass
+class _Active:
+    """Per-sequence state for a request currently inside the generator."""
+    job: _Job
+    tokens: list[int] = field(default_factory=list)
+    detok: object = None  # a fresh StreamingDetokenizer, for stream jobs
 
 
 class Engine:
@@ -48,6 +55,9 @@ class Engine:
         )
         self._prefix_ids: list[int] = []
         self._prefix_cache = None
+        # uid -> _Active. Only ever touched by the gpu-scheduler thread.
+        self._active: dict[int, _Active] = {}
+        self._gen: Optional[BatchGenerator] = None
 
     # --- lifecycle ---
     def start(self):
@@ -59,21 +69,24 @@ class Engine:
         self.model, self.tokenizer = load(settings.model_path)
         if settings.enable_prefix_cache:
             self._build_prefix_cache()
+        self._gen = self._new_generator()
         self._ready.set()
         self._loop()  # never returns
+
+    def _new_generator(self) -> BatchGenerator:
+        return BatchGenerator(
+            self.model,
+            stop_tokens=[[t] for t in self.tokenizer.eos_token_ids],
+            completion_batch_size=settings.max_concurrent_seqs,
+            prefill_batch_size=settings.prefill_batch_size,
+        )
 
     # --- prompt encoding ---
     def _encode_ids(self, messages: list[ChatMessage]) -> list[int]:
         as_dicts = [{"role": m.role, "content": m.content} for m in messages]
         return self.tokenizer.apply_chat_template(
             as_dicts, add_generation_prompt=True
-        )  # default tokenize=True -> token IDs, what batch_generate wants
-
-    def _encode_str(self, messages: list[ChatMessage]) -> str:
-        as_dicts = [{"role": m.role, "content": m.content} for m in messages]
-        return self.tokenizer.apply_chat_template(
-            as_dicts, add_generation_prompt=True, tokenize=False
-        )  # string, what stream_generate wants
+        )  # default tokenize=True -> token IDs, what insert() wants
 
     # --- public submit APIs ---
     async def submit_batch(
@@ -113,7 +126,7 @@ class Engine:
             _Job(
                 kind="stream",
                 max_tokens=max_tokens,
-                prompt_str=self._encode_str(messages),
+                prompt_ids=self._encode_ids(messages),
                 out_queue=out,
                 temperature=temperature,
                 top_k=top_k,
@@ -126,128 +139,131 @@ class Engine:
                 break
             yield item
 
-    # --- scheduler loop (runs on the gpu thread) ---
+    # --- scheduler loop (runs on the gpu thread) -----------------------------
+    #
+    # One long-lived BatchGenerator decodes every in-flight request together,
+    # one token per step. Each iteration admits any newly-arrived jobs (so they
+    # join mid-flight) and then advances every active sequence by one token.
+    # Batch and stream jobs share this path; they differ only in how output is
+    # delivered (a Future vs. a per-request queue).
     def _loop(self):
         while True:
-            job = self._jobs.get()  # blocks until at least one job
-            metrics.QUEUE_DEPTH.set(self._jobs.qsize())
-            if job.kind == "stream":
-                self._do_stream(job)
+            self._admit_ready()
+
+            if not self._active:
+                # Nothing running and nothing admitted -> block for the next
+                # arrival instead of spinning, then loop to admit it.
+                job = self._jobs.get()
+                self._jobs.put(job)
                 continue
 
-            batch = [job]
-            while len(batch) < settings.max_batch_size:
-                try:
-                    nxt = self._jobs.get_nowait()
-                except queue.Empty:
-                    break
-                if nxt.kind == "stream":
-                    # can't batch a stream job: flush what we have, then stream
-                    self._do_batch(batch)
-                    batch = []
-                    self._do_stream(nxt)
-                    break
-                batch.append(nxt)
-            if batch:
-                self._do_batch(batch)
+            start = time.time()
+            try:
+                responses = self._gen.next_generated()
+            except Exception:  # model-level failure: don't wedge the loop
+                log.exception("decode step failed; failing %d jobs", len(self._active))
+                for uid, active in list(self._active.items()):
+                    self._fail(uid, active)
+                self._gen = self._new_generator()
+                continue
+            metrics.GENERATION_SECONDS.observe(time.time() - start)
 
-    def _do_batch(self, jobs: list[_Job]):
-        prompts, caches, used = [], [], 0
-        for j in jobs:
-            suffix, hit = self._strip_prefix(j.prompt_ids)
-            prompts.append(suffix)
-            if hit:
-                caches.append(copy.deepcopy(self._prefix_cache))
-                used += 1
-                metrics.PREFIX_CACHE.labels(result="hit").inc()
-            else:
-                caches.append(None)
-                metrics.PREFIX_CACHE.labels(result="miss").inc()
+            if responses:
+                metrics.BATCH_SIZE.observe(len(responses))
+            for r in responses:
+                self._handle_response(r)
 
-        if used == 0:
-            batch_caches = None
+            metrics.ACTIVE_SEQUENCES.set(len(self._active))
+            metrics.QUEUE_DEPTH.set(self._jobs.qsize())
+
+    def _admit_ready(self):
+        """Insert every queued job into the running generator (non-blocking)."""
+        while True:
+            try:
+                job = self._jobs.get_nowait()
+            except queue.Empty:
+                return
+            self._admit(job)
+
+    def _admit(self, job: _Job):
+        suffix, hit = self._strip_prefix(job.prompt_ids)
+        if hit:
+            caches = [copy.deepcopy(self._prefix_cache)]
+            metrics.PREFIX_CACHE.labels(result="hit").inc()
         else:
-            batch_caches = [
-                c if c is not None else make_prompt_cache(self.model)
-                for c in caches
-            ]
+            caches = None  # insert() will allocate a fresh cache
+            metrics.PREFIX_CACHE.labels(result="miss").inc()
 
-        # One verified sampler per request, so each request's temperature,
-        # top_k and top_p are honored even when requests share a batch. This
-        # is the same make_sampler the streaming path uses; BatchGenerator
-        # keeps the per-sequence samplers aligned as sequences finish.
-        samplers = [make_sampler(j.temperature, j.top_k, j.top_p) for j in jobs]
-
-        metrics.BATCH_SIZE.observe(len(jobs))
-        metrics.REQUESTS.labels(mode="batch").inc(len(jobs))
-        metrics.INFLIGHT.inc(len(jobs))
-        log.info("batch of %d | prefix hits: %d", len(jobs), used)
-
-        start = time.time()
-        gen = None
-        try:
-            # We drive BatchGenerator directly (instead of the batch_generate
-            # convenience wrapper) because only insert() accepts per-prompt
-            # samplers; the wrapper would force a single shared sampler.
-            gen = BatchGenerator(
-                self.model,
-                stop_tokens=[[t] for t in self.tokenizer.eos_token_ids],
-            )
-            uids = gen.insert(
-                prompts,
-                max_tokens=[j.max_tokens for j in jobs],
-                caches=batch_caches,
-                samplers=samplers,
-            )
-            results: dict = {uid: [] for uid in uids}
-            with gen.stats() as stats:
-                while responses := gen.next_generated():
-                    for r in responses:
-                        # The eos "stop" token is signalled but not emitted.
-                        if r.finish_reason != "stop":
-                            results[r.uid].append(r.token)
-
-            metrics.TOKENS.inc(stats.generation_tokens)
-            for j, uid in zip(jobs, uids):
-                text = self.tokenizer.decode(results[uid])
-                j.loop.call_soon_threadsafe(j.future.set_result, text)
-        except Exception as exc:
-            for j in jobs:
-                j.loop.call_soon_threadsafe(j.future.set_exception, exc)
-        finally:
-            if gen is not None:
-                gen.close()
-            metrics.GENERATION_SECONDS.observe(time.time() - start)
-            metrics.INFLIGHT.dec(len(jobs))
-
-    def _do_stream(self, job: _Job):
+        # Same verified sampler the whole server uses; one per request so each
+        # request's temperature/top_k/top_p is honored within the shared batch.
         sampler = make_sampler(job.temperature, job.top_k, job.top_p)
-        metrics.REQUESTS.labels(mode="stream").inc()
+        uid = self._gen.insert(
+            [suffix],
+            max_tokens=[job.max_tokens],
+            caches=caches,
+            samplers=[sampler],
+        )[0]
+
+        active = _Active(job=job)
+        if job.kind == "stream":
+            # Each stream needs its own incremental detokenizer; the property
+            # hands back a fresh instance per access.
+            active.detok = self.tokenizer.detokenizer
+            active.detok.reset()
+        self._active[uid] = active
+
+        metrics.REQUESTS.labels(mode=job.kind).inc()
         metrics.INFLIGHT.inc()
-        start = time.time()
-        try:
-            for chunk in stream_generate(
-                self.model,
-                self.tokenizer,
-                prompt=job.prompt_str,
-                max_tokens=job.max_tokens,
-                sampler=sampler,
-            ):
-                metrics.TOKENS.inc()
-                job.out_queue.put(chunk.text)
-        finally:
-            metrics.GENERATION_SECONDS.observe(time.time() - start)
-            metrics.INFLIGHT.dec()
+
+    def _handle_response(self, r):
+        active = self._active.get(r.uid)
+        if active is None:
+            return  # already finished/removed
+        metrics.TOKENS.inc()
+
+        # The eos "stop" token is signalled but never emitted to the client.
+        if r.finish_reason != "stop":
+            active.tokens.append(r.token)
+            if active.job.kind == "stream":
+                active.detok.add_token(r.token)
+                seg = active.detok.last_segment
+                if seg:
+                    active.job.out_queue.put(seg)
+
+        if r.finish_reason is not None:
+            self._finish(r.uid, active)
+
+    def _finish(self, uid: int, active: _Active):
+        job = active.job
+        if job.kind == "stream":
+            active.detok.finalize()
+            seg = active.detok.last_segment
+            if seg:
+                job.out_queue.put(seg)
             job.out_queue.put(_SENTINEL)
-            
-            
+        else:
+            text = self.tokenizer.decode(active.tokens)
+            job.loop.call_soon_threadsafe(job.future.set_result, text)
+        self._active.pop(uid, None)
+        metrics.INFLIGHT.dec()
+
+    def _fail(self, uid: int, active: _Active):
+        """End a request after a model-level error without crashing the loop."""
+        job = active.job
+        if job.kind == "stream":
+            job.out_queue.put(_SENTINEL)
+        else:
+            exc = RuntimeError("generation failed")
+            job.loop.call_soon_threadsafe(job.future.set_exception, exc)
+        self._active.pop(uid, None)
+        metrics.INFLIGHT.dec()
+
+    # --- prefix cache --------------------------------------------------------
     def _build_prefix_cache(self):
         # Tokenize the system block alone, opening the user turn, so the
         # cached prefix ends exactly where real requests' user content begins.
-        msgs = [{"role": "system", "content": settings.system_prompt}]
-        # add_generation_prompt=False here: we want the user-turn header,
-        # not the assistant header. We append the user header explicitly by
-        # tokenizing a sentinel request and taking the shared lead.
+        # We find the shared lead by tokenizing two sentinel requests and
+        # taking their common prefix (the assistant header differs per content).
         probe_a = self._encode_ids(
             [ChatMessage(role="system", content=settings.system_prompt),
              ChatMessage(role="user", content="x")]

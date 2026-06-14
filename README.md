@@ -97,7 +97,8 @@ print(resp.choices[0].message.content)
 Settings are environment variables with the `INFER_` prefix:
 
 - `INFER_MODEL_PATH` - model repo or path.
-- `INFER_MAX_BATCH_SIZE` - max requests per batch (default 8).
+- `INFER_MAX_CONCURRENT_SEQS` - max sequences decoding together (default 16).
+- `INFER_PREFILL_BATCH_SIZE` - max sequences prefilling together (default 8).
 - `INFER_SYSTEM_PROMPT` - system prompt to precompute and cache.
 - `INFER_ENABLE_PREFIX_CACHE` - toggle prefix caching (default true).
 
@@ -105,16 +106,21 @@ Settings are environment variables with the `INFER_` prefix:
 
 Requests enter through a FastAPI layer that validates them against
 the OpenAI schema. A single scheduler thread owns the model and all
-GPU work (MLX requires GPU operations to stay on one thread). The
-scheduler drains a queue of pending requests, groups non-streaming
-ones into a batch, and runs them together. Streaming requests run
-one at a time through the sampler.
+GPU work (MLX requires GPU operations to stay on one thread).
 
-The same verified C++ sampler drives **both** paths. Batched
-requests use one sampler instance per request (via
-`BatchGenerator`'s per-sequence samplers), so each request's
-`temperature`, `top_k` and `top_p` are honored even when requests
-share a batch.
+The scheduler runs **continuous batching**: one long-lived
+generator decodes every in-flight request together, one token per
+step. Each step admits any newly-arrived requests (so they join the
+running batch mid-flight) and advances every active sequence by one
+token; finished sequences leave and free their slot immediately.
+Streaming and non-streaming requests share this single path - they
+differ only in delivery (a token queue vs. a future). Streaming is
+no longer serialized: many streams decode concurrently.
+
+The same verified C++ sampler drives every request. Each request
+gets its own sampler instance (via the generator's per-sequence
+samplers), so its `temperature`, `top_k` and `top_p` are honored
+even while it shares decode steps with other requests.
 
 The C++ sampler is verified against a Python reference
 implementation across the full parameter space. The test runs in
@@ -131,6 +137,18 @@ test runs automatically in GitHub Actions. It verifies both C++
 entry points (the list-based `sample_logits` and the zero-copy
 `sample_logits_np` used in the hot path) against the reference.
 
+Continuous batching has its own correctness proof:
+
+```bash
+python3 proofs/check_continuous_batch.py
+```
+
+It asserts that a request submitted mid-flight decodes in the same
+steps as one already running (real batching, not serialization),
+and that text streamed token-by-token is byte-identical to the same
+request decoded as a single batch (the per-sequence incremental
+detokenizer doesn't corrupt output).
+
 ## Benchmarks
 
 ```bash
@@ -138,10 +156,10 @@ python3 bench/bench_sampler.py     # sampler cost per token (no model needed)
 python3 bench/bench_server.py      # end-to-end throughput (needs a running server)
 ```
 
-The sampler runs once per generated token on the GPU scheduler
-thread, so its per-call cost is a direct tax on throughput. At
-Llama 3.2's 128,256-token vocabulary (`bench/bench_sampler.py`,
-Apple Silicon):
+**Sampler cost.** The sampler runs once per generated token on the
+GPU scheduler thread, so its per-call cost is a direct tax on
+throughput. At Llama 3.2's 128,256-token vocabulary
+(`bench/bench_sampler.py`, Apple Silicon):
 
 | approach                      | µs/token | vs NumPy |
 |-------------------------------|---------:|---------:|
@@ -154,6 +172,23 @@ The original C++ path was **3x slower than NumPy**: converting a
 the math it saved. Reading the NumPy buffer directly in C++
 (`sample_logits_np`) removed that overhead, making the C++ kernel a
 genuine 1.8x win and 5.6x faster than the old path.
+
+**Continuous batching.** Aggregate throughput scales with load
+while per-request latency grows sub-linearly
+(`bench/bench_server.py`, M-series, 64 tokens/request):
+
+| concurrency | tokens/sec | p50 latency |
+|------------:|-----------:|------------:|
+| 1           |  88        | 0.62 s      |
+| 2           | 140        | 0.78 s      |
+| 4           | 196        | 1.10 s      |
+| 8           | 231        | 1.91 s      |
+
+Because streams share decode steps instead of running one at a
+time, streaming time-to-first-token stays bounded as concurrent
+streams pile up (p50): ~100 ms at 1 stream, ~530 ms at 8. Under the
+old one-at-a-time model the 8th stream's first token waited for the
+previous seven to finish.
 
 ## Deployment and portability
 
@@ -171,9 +206,15 @@ engine is structured to allow this; it is not yet implemented.
 
 ## Known limitations and future work
 
-- Streaming requests are served one at a time, not batched.
-  Batching streamed requests requires a lower-level generation API.
+- No request cancellation yet: if a client disconnects mid-stream,
+  the sequence keeps generating until it finishes. The generator
+  supports removing a sequence by id, so this is a small follow-up.
 - Prefix caching covers a shared system prompt, not arbitrary
-  per-conversation history.
+  per-conversation history. A prefix-tree (radix) cache would reuse
+  any shared lead across requests.
+- A prefix-cache hit deep-copies the cached KV state per request.
+  This grows with load; a cache pool would avoid the per-request copy.
 - The C++ sampler runs on CPU and copies logits from the GPU each
-  token. A Metal-native sampler would remove that transfer.
+  token. This is the main single-stream cost and the reason
+  throughput climbs with batch width. A Metal-native sampler would
+  remove the transfer.

@@ -11,7 +11,11 @@ class Settings(BaseSettings):
     port: int = 8000
     max_tokens: int = 512
     
-    max_batch_size: int = 8
+    # Continuous batching. The scheduler runs one long-lived BatchGenerator;
+    # these cap how many sequences decode and prefill concurrently. They map to
+    # BatchGenerator's completion_batch_size / prefill_batch_size.
+    max_concurrent_seqs: int = 16
+    prefill_batch_size: int = 8
     system_prompt: str = (
         "You are a helpful assistant. Answer concisely and accurately. "
         "Always be polite and clear, and never make up information."
